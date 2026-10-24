@@ -1,0 +1,144 @@
+--- git commit ---
+3ac56acd3376f2952eb636a133f4b5aa30142552
+
+
+--- git status ---
+HEAD detached at v5.0.1
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   rsl_rl/algorithms/__init__.py
+	modified:   rsl_rl/models/__init__.py
+	modified:   rsl_rl/runners/__init__.py
+	modified:   rsl_rl/storage/rollout_storage.py
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	rsl_rl/algorithms/ppo_vae.py
+	rsl_rl/models/dwaq_model.py
+	rsl_rl/modules/actor_critic.py
+	rsl_rl/modules/actor_critic_DWAQ.py
+	rsl_rl/runners/on_policy_runner_vae.py
+
+no changes added to commit (use "git add" and/or "git commit -a") 
+
+
+--- git diff ---
+diff --git a/rsl_rl/algorithms/__init__.py b/rsl_rl/algorithms/__init__.py
+index 33129ef..36e08c9 100644
+--- a/rsl_rl/algorithms/__init__.py
++++ b/rsl_rl/algorithms/__init__.py
+@@ -7,5 +7,6 @@
+ 
+ from .distillation import Distillation
+ from .ppo import PPO
++from .ppo_vae import PPO_VAE
+ 
+-__all__ = ["PPO", "Distillation"]
++__all__ = ["PPO", "PPO_VAE", "Distillation"]
+diff --git a/rsl_rl/models/__init__.py b/rsl_rl/models/__init__.py
+index 3bfe433..51ae0cc 100644
+--- a/rsl_rl/models/__init__.py
++++ b/rsl_rl/models/__init__.py
+@@ -6,11 +6,13 @@
+ """Neural models for the learning algorithm."""
+ 
+ from .cnn_model import CNNModel
++from .dwaq_model import DWAQModel
+ from .mlp_model import MLPModel
+ from .rnn_model import RNNModel
+ 
+ __all__ = [
+     "CNNModel",
++    "DWAQModel",
+     "MLPModel",
+     "RNNModel",
+ ]
+diff --git a/rsl_rl/runners/__init__.py b/rsl_rl/runners/__init__.py
+index a6804ec..49f04fe 100644
+--- a/rsl_rl/runners/__init__.py
++++ b/rsl_rl/runners/__init__.py
+@@ -6,6 +6,7 @@
+ """Runners for environment-agent interaction."""
+ 
+ from .on_policy_runner import OnPolicyRunner  # noqa: I001
++from .on_policy_runner_vae import DWAQOnPolicyRunner
+ from .distillation_runner import DistillationRunner
+ 
+-__all__ = ["DistillationRunner", "OnPolicyRunner"]
++__all__ = ["OnPolicyRunner", "DWAQOnPolicyRunner", "DistillationRunner"]
+diff --git a/rsl_rl/storage/rollout_storage.py b/rsl_rl/storage/rollout_storage.py
+index 1c01232..a2ce539 100644
+--- a/rsl_rl/storage/rollout_storage.py
++++ b/rsl_rl/storage/rollout_storage.py
+@@ -60,6 +60,10 @@ class RolloutStorage:
+             self.hidden_states: tuple[HiddenState, HiddenState] = (None, None)
+             """Hidden states for recurrent networks, e.g., (actor, critic)."""
+ 
++            # For VAE encoder code (DWAQ models)
++            self.code: torch.Tensor | None = None
++            """Encoder code from DWAQ models (RL with VAE only)."""
++
+         def clear(self) -> None:
+             """Reset all transition fields to None."""
+             self.__init__()
+@@ -84,6 +88,7 @@ class RolloutStorage:
+             masks: torch.Tensor | None = None,
+             privileged_actions: torch.Tensor | None = None,
+             dones: torch.Tensor | None = None,
++            code: torch.Tensor | None = None,
+         ) -> None:
+             """Initialize a batch container over rollout data."""
+             self.observations: TensorDict | None = observations
+@@ -122,6 +127,9 @@ class RolloutStorage:
+             self.masks: torch.Tensor | None = masks
+             """Batch of trajectory masks for recurrent networks (RL recurrent only)."""
+ 
++            self.code: torch.Tensor | None = code
++            """Batch of encoder codes for DWAQ models (RL with VAE only)."""
++
+     def __init__(
+         self,
+         training_type: str,
+@@ -159,6 +167,9 @@ class RolloutStorage:
+             self.distribution_params: tuple[torch.Tensor, ...] | None = None  # Lazily initialized on first transition
+             self.returns = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+             self.advantages = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
++            # For VAE encoder code (lazy-init on first transition with code)
++            self._codes: torch.Tensor | None = None
++            self._code_dim: int | None = None
+ 
+         # For recurrent networks
+         self.saved_hidden_state_a = None
+@@ -195,6 +206,15 @@ class RolloutStorage:
+             for i, p in enumerate(transition.distribution_params):  # type: ignore
+                 self.distribution_params[i][self.step].copy_(p)
+ 
++            # Store VAE encoder code if present
++            if hasattr(transition, 'code') and transition.code is not None:
++                if self._codes is None:
++                    self._code_dim = transition.code.shape[-1]
++                    self._codes = torch.zeros(
++                        self.num_transitions_per_env, self.num_envs, self._code_dim, device=self.device
++                    )
++                self._codes[self.step].copy_(transition.code)
++
+         # For RNN networks
+         self._save_hidden_states(transition.hidden_states)
+ 
+@@ -235,6 +255,7 @@ class RolloutStorage:
+         old_actions_log_prob = self.actions_log_prob.flatten(0, 1)
+         advantages = self.advantages.flatten(0, 1)
+         old_distribution_params = tuple(p.flatten(0, 1) for p in self.distribution_params)  # type: ignore
++        codes = self._codes.flatten(0, 1) if self._codes is not None else None
+ 
+         for epoch in range(num_epochs):
+             for i in range(num_mini_batches):
+@@ -252,6 +273,7 @@ class RolloutStorage:
+                     returns=returns[batch_idx],
+                     old_actions_log_prob=old_actions_log_prob[batch_idx],
+                     old_distribution_params=tuple(p[batch_idx] for p in old_distribution_params),
++                    code=codes[batch_idx] if codes is not None else None,
+                 )
+ 
+     # For reinforcement learning with recurrent networks

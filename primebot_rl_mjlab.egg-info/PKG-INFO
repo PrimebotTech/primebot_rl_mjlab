@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: primebot_rl_mjlab
+Version: 0.0.1
+License-File: LICENCE
+Requires-Dist: mujoco
+Requires-Dist: numpy
+Requires-Dist: torch
+Requires-Dist: tyro
+Requires-Dist: tqdm
+Dynamic: license-file
+Dynamic: requires-dist
